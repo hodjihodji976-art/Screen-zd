@@ -1,0 +1,717 @@
+name: Build APK
+
+# Cara pakai: simpan file ini sebagai .github/workflows/build.yml di repo GitHub.
+# Setelah commit, build jalan otomatis. APK muncul di tab Releases.
+
+on:
+  push:
+    branches: [main, master]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Generate project
+        run: |
+          mkdir -p $(dirname settings.gradle.kts)
+          cat > settings.gradle.kts <<'EOF'
+          pluginManagement {
+              repositories { google(); mavenCentral(); gradlePluginPortal() }
+          }
+          dependencyResolutionManagement {
+              repositories { google(); mavenCentral() }
+          }
+          rootProject.name = "ScreenRecorder120"
+          include(":app")
+          EOF
+          mkdir -p $(dirname build.gradle.kts)
+          cat > build.gradle.kts <<'EOF'
+          plugins {
+              id("com.android.application") version "8.5.2" apply false
+              id("org.jetbrains.kotlin.android") version "1.9.24" apply false
+          }
+          EOF
+          mkdir -p $(dirname gradle.properties)
+          cat > gradle.properties <<'EOF'
+          org.gradle.jvmargs=-Xmx2g
+          android.useAndroidX=true
+          EOF
+          mkdir -p $(dirname app/build.gradle.kts)
+          cat > app/build.gradle.kts <<'EOF'
+          plugins {
+              id("com.android.application")
+              id("org.jetbrains.kotlin.android")
+          }
+
+          android {
+              namespace = "com.example.screenrecorder"
+              compileSdk = 34
+              defaultConfig {
+                  applicationId = "com.example.screenrecorder"
+                  minSdk = 29
+                  targetSdk = 34
+                  versionCode = 1
+                  versionName = "1.0"
+              }
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+              kotlinOptions { jvmTarget = "17" }
+          }
+          EOF
+          mkdir -p $(dirname app/src/main/AndroidManifest.xml)
+          cat > app/src/main/AndroidManifest.xml <<'EOF'
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE"/>
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PROJECTION"/>
+              <uses-permission android:name="android.permission.RECORD_AUDIO"/>
+              <uses-permission android:name="android.permission.POST_NOTIFICATIONS"/>
+
+              <application
+                  android:label="Screen Recorder 120"
+                  android:icon="@android:drawable/ic_media_play"
+                  android:theme="@android:style/Theme.Material.Light">
+
+                  <activity android:name=".MainActivity" android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN"/>
+                          <category android:name="android.intent.category.LAUNCHER"/>
+                      </intent-filter>
+                  </activity>
+
+                  <service
+                      android:name=".RecorderService"
+                      android:foregroundServiceType="mediaProjection"
+                      android:exported="false"/>
+              </application>
+          </manifest>
+          EOF
+          mkdir -p $(dirname app/src/main/java/com/example/screenrecorder/MainActivity.kt)
+          cat > app/src/main/java/com/example/screenrecorder/MainActivity.kt <<'EOF'
+          package com.example.screenrecorder
+
+          import android.Manifest
+          import android.app.Activity
+          import android.content.Intent
+          import android.content.pm.PackageManager
+          import android.media.projection.MediaProjectionManager
+          import android.os.Build
+          import android.os.Bundle
+          import android.widget.ArrayAdapter
+          import android.widget.Button
+          import android.widget.CheckBox
+          import android.widget.LinearLayout
+          import android.widget.Spinner
+          import android.widget.TextView
+
+          class MainActivity : Activity() {
+
+              private val fpsVals = intArrayOf(30, 60, 90, 120)
+              private val resVals = intArrayOf(720, 1080, 0)
+              private lateinit var fpsSp: Spinner
+              private lateinit var resSp: Spinner
+              private lateinit var oriSp: Spinner
+              private lateinit var audioCb: CheckBox
+
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  val d = resources.displayMetrics.density
+                  val pad = (24 * d).toInt()
+                  val root = LinearLayout(this).apply {
+                      orientation = LinearLayout.VERTICAL
+                      setPadding(pad, pad, pad, pad)
+                  }
+
+                  fun label(t: String) = TextView(this).apply {
+                      text = t
+                      textSize = 14f
+                      setPadding(0, (12 * d).toInt(), 0, 0)
+                  }
+                  fun spinner(items: List<String>, sel: Int) = Spinner(this).apply {
+                      adapter = ArrayAdapter(
+                          this@MainActivity, android.R.layout.simple_spinner_dropdown_item, items
+                      )
+                      setSelection(sel)
+                  }
+
+                  root.addView(label("FPS target"))
+                  fpsSp = spinner(fpsVals.map { "$it fps" }, 3)
+                  root.addView(fpsSp)
+
+                  root.addView(label("Resolusi"))
+                  resSp = spinner(listOf("720p", "1080p", "Native (asli)"), 1)
+                  root.addView(resSp)
+
+                  root.addView(label("Orientasi"))
+                  oriSp = spinner(listOf("Landscape (game)", "Portrait"), 0)
+                  root.addView(oriSp)
+
+                  audioCb = CheckBox(this).apply {
+                      text = "Rekam audio internal"
+                      isChecked = true
+                  }
+                  root.addView(audioCb)
+
+                  root.addView(Button(this).apply {
+                      text = "Mulai Rekam"
+                      setOnClickListener { onStartClicked() }
+                  })
+                  root.addView(Button(this).apply {
+                      text = "Berhenti"
+                      setOnClickListener {
+                          startService(
+                              Intent(this@MainActivity, RecorderService::class.java)
+                                  .setAction(RecorderService.ACTION_STOP)
+                          )
+                      }
+                  })
+                  root.addView(label("Hasil: Galeri > Movies/ScreenRecorder120.\nBerhenti juga bisa lewat notifikasi."))
+                  setContentView(root)
+              }
+
+              private fun granted(p: String) = checkSelfPermission(p) == PackageManager.PERMISSION_GRANTED
+
+              private fun onStartClicked() {
+                  val need = mutableListOf<String>()
+                  if (audioCb.isChecked && !granted(Manifest.permission.RECORD_AUDIO))
+                      need += Manifest.permission.RECORD_AUDIO
+                  if (Build.VERSION.SDK_INT >= 33 && !granted(Manifest.permission.POST_NOTIFICATIONS))
+                      need += Manifest.permission.POST_NOTIFICATIONS
+                  if (need.isEmpty()) askProjection() else requestPermissions(need.toTypedArray(), 1)
+              }
+
+              override fun onRequestPermissionsResult(code: Int, p: Array<out String>, r: IntArray) {
+                  super.onRequestPermissionsResult(code, p, r)
+                  askProjection()
+              }
+
+              private fun askProjection() {
+                  val mpm = getSystemService(MediaProjectionManager::class.java)
+                  startActivityForResult(mpm.createScreenCaptureIntent(), 100)
+              }
+
+              @Deprecated("Deprecated in Java")
+              override fun onActivityResult(req: Int, res: Int, data: Intent?) {
+                  super.onActivityResult(req, res, data)
+                  if (req == 100 && res == RESULT_OK && data != null) {
+                      val i = Intent(this, RecorderService::class.java)
+                          .setAction(RecorderService.ACTION_START)
+                          .putExtra("code", res)
+                          .putExtra("data", data)
+                          .putExtra("fps", fpsVals[fpsSp.selectedItemPosition])
+                          .putExtra("res", resVals[resSp.selectedItemPosition])
+                          .putExtra("land", oriSp.selectedItemPosition == 0)
+                          .putExtra("audio", audioCb.isChecked && granted(Manifest.permission.RECORD_AUDIO))
+                      startForegroundService(i)
+                      moveTaskToBack(true)
+                  }
+              }
+          }
+          EOF
+          mkdir -p $(dirname app/src/main/java/com/example/screenrecorder/RecorderService.kt)
+          cat > app/src/main/java/com/example/screenrecorder/RecorderService.kt <<'EOF'
+          package com.example.screenrecorder
+
+          import android.app.Notification
+          import android.app.NotificationChannel
+          import android.app.NotificationManager
+          import android.app.PendingIntent
+          import android.app.Service
+          import android.content.Intent
+          import android.content.pm.ServiceInfo
+          import android.graphics.drawable.Icon
+          import android.media.projection.MediaProjection
+          import android.media.projection.MediaProjectionManager
+          import android.os.Build
+          import android.os.Handler
+          import android.os.IBinder
+          import android.os.Looper
+          import android.util.DisplayMetrics
+          import android.view.WindowManager
+          import android.widget.Toast
+
+          class RecorderService : Service() {
+
+              companion object {
+                  const val ACTION_START = "start"
+                  const val ACTION_STOP = "stop"
+              }
+
+              private var recorder: Recorder? = null
+              private var projection: MediaProjection? = null
+              private val main = Handler(Looper.getMainLooper())
+
+              override fun onBind(intent: Intent?): IBinder? = null
+
+              override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+                  if (intent?.action == ACTION_START) {
+                      startRecording(intent)
+                  } else {
+                      stopRecording()
+                      stopSelf()
+                  }
+                  return START_NOT_STICKY
+              }
+
+              @Suppress("DEPRECATION")
+              private fun startRecording(i: Intent) {
+                  if (recorder != null) return
+
+                  val nm = getSystemService(NotificationManager::class.java)
+                  nm.createNotificationChannel(
+                      NotificationChannel("rec", "Perekaman layar", NotificationManager.IMPORTANCE_LOW)
+                  )
+                  val stopPi = PendingIntent.getService(
+                      this, 0,
+                      Intent(this, RecorderService::class.java).setAction(ACTION_STOP),
+                      PendingIntent.FLAG_IMMUTABLE
+                  )
+                  val action = Notification.Action.Builder(
+                      Icon.createWithResource(this, android.R.drawable.ic_media_pause), "Berhenti", stopPi
+                  ).build()
+                  val notif = Notification.Builder(this, "rec")
+                      .setContentTitle("Sedang merekam layar")
+                      .setContentText("Ketuk untuk berhenti & simpan")
+                      .setSmallIcon(android.R.drawable.ic_media_play)
+                      .setContentIntent(stopPi)
+                      .addAction(action)
+                      .setOngoing(true)
+                      .build()
+                  startForeground(1, notif, ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION)
+
+                  val code = i.getIntExtra("code", 0)
+                  val data: Intent? = if (Build.VERSION.SDK_INT >= 33)
+                      i.getParcelableExtra("data", Intent::class.java)
+                  else i.getParcelableExtra("data")
+                  if (data == null) { stopSelf(); return }
+
+                  try {
+                      val mp = getSystemService(MediaProjectionManager::class.java)
+                          .getMediaProjection(code, data)
+                      projection = mp
+                      // Wajib didaftarkan sebelum membuat VirtualDisplay (Android 14+)
+                      mp.registerCallback(object : MediaProjection.Callback() {
+                          override fun onStop() { stopRecording(); stopSelf() }
+                      }, main)
+
+                      val dm = DisplayMetrics()
+                      (getSystemService(WINDOW_SERVICE) as WindowManager).defaultDisplay.getRealMetrics(dm)
+
+                      val r = Recorder(
+                          ctx = this,
+                          projection = mp,
+                          shortSide = minOf(dm.widthPixels, dm.heightPixels),
+                          longSide = maxOf(dm.widthPixels, dm.heightPixels),
+                          densityDpi = dm.densityDpi,
+                          landscape = i.getBooleanExtra("land", true),
+                          targetShort = i.getIntExtra("res", 1080),
+                          reqFps = i.getIntExtra("fps", 120),
+                          wantAudio = i.getBooleanExtra("audio", true)
+                      )
+                      r.start()
+                      recorder = r
+                      val info = "Merekam ${r.width}x${r.height} @ ${r.fps}fps" +
+                          if (r.hasAudio) " + audio internal" else " (tanpa audio)"
+                      Toast.makeText(this, info, Toast.LENGTH_LONG).show()
+                  } catch (e: Exception) {
+                      Toast.makeText(this, "Gagal: ${e.message}", Toast.LENGTH_LONG).show()
+                      stopRecording()
+                      stopSelf()
+                  }
+              }
+
+              private fun stopRecording() {
+                  val r = recorder
+                  recorder = null
+                  if (r != null) {
+                      r.stop()
+                      Toast.makeText(this, "Rekaman tersimpan di Galeri", Toast.LENGTH_SHORT).show()
+                  }
+                  val mp = projection
+                  projection = null
+                  mp?.stop()
+              }
+
+              override fun onDestroy() {
+                  stopRecording()
+                  super.onDestroy()
+              }
+          }
+          EOF
+          mkdir -p $(dirname app/src/main/java/com/example/screenrecorder/Recorder.kt)
+          cat > app/src/main/java/com/example/screenrecorder/Recorder.kt <<'EOF'
+          package com.example.screenrecorder
+
+          import android.content.ContentValues
+          import android.content.Context
+          import android.hardware.display.DisplayManager
+          import android.hardware.display.VirtualDisplay
+          import android.media.AudioAttributes
+          import android.media.AudioFormat
+          import android.media.AudioPlaybackCaptureConfiguration
+          import android.media.AudioRecord
+          import android.media.MediaCodec
+          import android.media.MediaCodecInfo
+          import android.media.MediaFormat
+          import android.media.MediaMuxer
+          import android.media.projection.MediaProjection
+          import android.net.Uri
+          import android.os.ParcelFileDescriptor
+          import android.provider.MediaStore
+          import java.nio.ByteBuffer
+          import java.util.concurrent.TimeUnit
+          import java.util.concurrent.locks.ReentrantLock
+          import kotlin.concurrent.withLock
+
+          /** * Video: layar -> VirtualDisplay -> MediaCodec H.264 (hardware, surface input) * Audio: AudioPlaybackCapture (audio internal) -> AAC * Output: MP4 lewat MediaMuxer ke Movies/ScreenRecorder120 */
+          class Recorder(
+              private val ctx: Context,
+              private val projection: MediaProjection,
+              private val shortSide: Int,
+              private val longSide: Int,
+              private val densityDpi: Int,
+              private val landscape: Boolean,
+              private val targetShort: Int,
+              private val reqFps: Int,
+              private val wantAudio: Boolean
+          ) {
+              var width = 0
+                  private set
+              var height = 0
+                  private set
+              var fps = 0
+                  private set
+              var hasAudio = false
+                  private set
+
+              private val mime = MediaFormat.MIMETYPE_VIDEO_AVC
+              private val sampleRate = 44100
+
+              private var vEnc: MediaCodec? = null
+              private var aEnc: MediaCodec? = null
+              private var aRec: AudioRecord? = null
+              private var muxer: MediaMuxer? = null
+              private var pfd: ParcelFileDescriptor? = null
+              private var uri: Uri? = null
+              private var vd: VirtualDisplay? = null
+              private var vThread: Thread? = null
+              private var aThread: Thread? = null
+
+              @Volatile private var running = false
+              private val baseUs = System.nanoTime() / 1000
+
+              private val lock = ReentrantLock()
+              private val started = lock.newCondition()
+              private var tracksAdded = 0
+              private var tracksExpected = 1
+              private var muxStarted = false
+              private var vTrack = -1
+              private var aTrack = -1
+
+              fun start() {
+                  try {
+                      doStart()
+                  } catch (e: Exception) {
+                      running = false
+                      cleanup(true)
+                      throw e
+                  }
+              }
+
+              private fun doStart() {
+                  val scale = if (targetShort in 1 until shortSide) targetShort.toFloat() / shortSide else 1f
+                  val s = (shortSide * scale).toInt()
+                  val l = (longSide * scale).toInt()
+
+                  val enc = MediaCodec.createEncoderByType(mime)
+                  vEnc = enc
+                  val vc = enc.codecInfo.getCapabilitiesForType(mime).videoCapabilities
+                  val wa = vc.widthAlignment
+                  val ha = vc.heightAlignment
+                  width = (if (landscape) l else s) / wa * wa
+                  height = (if (landscape) s else l) / ha * ha
+
+                  // Turunkan FPS otomatis jika encoder HP tidak mendukung
+                  var f = reqFps
+                  while (f > 30 && !vc.areSizeAndRateSupported(width, height, f.toDouble())) f -= 30
+                  fps = f
+
+                  val wantBr = (width.toLong() * height * fps / 10).coerceIn(4_000_000L, 80_000_000L).toInt()
+                  val bitrate = vc.bitrateRange.clamp(wantBr)
+
+                  val vf = MediaFormat.createVideoFormat(mime, width, height).apply {
+                      setInteger(MediaFormat.KEY_COLOR_FORMAT, MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface)
+                      setInteger(MediaFormat.KEY_BIT_RATE, bitrate)
+                      setInteger(MediaFormat.KEY_FRAME_RATE, fps)
+                      setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 1)
+                      setInteger(MediaFormat.KEY_PRIORITY, 0)          // realtime
+                      setInteger(MediaFormat.KEY_OPERATING_RATE, fps)
+                  }
+                  enc.configure(vf, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
+                  val surface = enc.createInputSurface()
+                  enc.start()
+
+                  if (wantAudio) setupAudio()
+
+                  val cv = ContentValues().apply {
+                      put(MediaStore.Video.Media.DISPLAY_NAME, "rec_${System.currentTimeMillis()}.mp4")
+                      put(MediaStore.Video.Media.MIME_TYPE, "video/mp4")
+                      put(MediaStore.Video.Media.RELATIVE_PATH, "Movies/ScreenRecorder120")
+                      put(MediaStore.Video.Media.IS_PENDING, 1)
+                  }
+                  val u = ctx.contentResolver.insert(MediaStore.Video.Media.EXTERNAL_CONTENT_URI, cv)
+                      ?: throw IllegalStateException("Tidak bisa membuat file")
+                  uri = u
+                  val p = ctx.contentResolver.openFileDescriptor(u, "rw")
+                      ?: throw IllegalStateException("Tidak bisa membuka file")
+                  pfd = p
+                  muxer = MediaMuxer(p.fileDescriptor, MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4)
+
+                  running = true
+                  vd = projection.createVirtualDisplay(
+                      "rec", width, height, densityDpi,
+                      DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR, surface, null, null
+                  )
+                  vThread = Thread({ drainVideo() }, "video-drain").also { it.start() }
+                  if (aEnc != null) {
+                      aRec?.startRecording()
+                      aThread = Thread({ audioLoop() }, "audio-loop").also { it.start() }
+                  }
+              }
+
+              private fun setupAudio() {
+                  try {
+                      val cfg = AudioPlaybackCaptureConfiguration.Builder(projection)
+                          .addMatchingUsage(AudioAttributes.USAGE_MEDIA)
+                          .addMatchingUsage(AudioAttributes.USAGE_GAME)
+                          .addMatchingUsage(AudioAttributes.USAGE_UNKNOWN)
+                          .build()
+                      val af = AudioFormat.Builder()
+                          .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
+                          .setSampleRate(sampleRate)
+                          .setChannelMask(AudioFormat.CHANNEL_IN_STEREO)
+                          .build()
+                      val minBuf = AudioRecord.getMinBufferSize(
+                          sampleRate, AudioFormat.CHANNEL_IN_STEREO, AudioFormat.ENCODING_PCM_16BIT
+                      )
+                      val rec = AudioRecord.Builder()
+                          .setAudioFormat(af)
+                          .setBufferSizeInBytes(minBuf * 4)
+                          .setAudioPlaybackCaptureConfig(cfg)
+                          .build()
+                      aRec = rec
+                      if (rec.state != AudioRecord.STATE_INITIALIZED) throw IllegalStateException("audio")
+
+                      val mf = MediaFormat.createAudioFormat(MediaFormat.MIMETYPE_AUDIO_AAC, sampleRate, 2).apply {
+                          setInteger(MediaFormat.KEY_AAC_PROFILE, MediaCodecInfo.CodecProfileLevel.AACObjectLC)
+                          setInteger(MediaFormat.KEY_BIT_RATE, 128_000)
+                          setInteger(MediaFormat.KEY_MAX_INPUT_SIZE, 16384)
+                      }
+                      val enc = MediaCodec.createEncoderByType(MediaFormat.MIMETYPE_AUDIO_AAC)
+                      enc.configure(mf, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
+                      enc.start()
+                      aEnc = enc
+                      tracksExpected = 2
+                      hasAudio = true
+                  } catch (e: Exception) {
+                      runCatching { aRec?.release() }
+                      runCatching { aEnc?.release() }
+                      aRec = null
+                      aEnc = null
+                      tracksExpected = 1
+                      hasAudio = false
+                  }
+              }
+
+              private fun addTrack(f: MediaFormat): Int = lock.withLock {
+                  val m = muxer ?: return -1
+                  val idx = m.addTrack(f)
+                  tracksAdded++
+                  if (tracksAdded == tracksExpected) {
+                      m.start()
+                      muxStarted = true
+                      started.signalAll()
+                  }
+                  idx
+              }
+
+              private fun dropAudio() {
+                  hasAudio = false
+                  lock.withLock {
+                      if (aTrack < 0 && tracksExpected == 2) {
+                          tracksExpected = 1
+                          if (!muxStarted && tracksAdded == 1) {
+                              muxer?.start()
+                              muxStarted = true
+                              started.signalAll()
+                          }
+                      }
+                  }
+              }
+
+              private fun write(track: Int, buf: ByteBuffer, info: MediaCodec.BufferInfo) {
+                  lock.withLock {
+                      var waited = 0
+                      while (!muxStarted && waited < 100) {
+                          started.await(50, TimeUnit.MILLISECONDS)
+                          waited++
+                      }
+                      if (!muxStarted || track < 0) return
+                      buf.position(info.offset)
+                      buf.limit(info.offset + info.size)
+                      muxer?.writeSampleData(track, buf, info)
+                  }
+              }
+
+              private fun drainVideo() {
+                  val enc = vEnc ?: return
+                  val info = MediaCodec.BufferInfo()
+                  var last = -1L
+                  try {
+                      loop@ while (true) {
+                          val i = enc.dequeueOutputBuffer(info, 10_000)
+                          if (i == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED) {
+                              vTrack = addTrack(enc.outputFormat)
+                          } else if (i >= 0) {
+                              val buf = enc.getOutputBuffer(i)
+                              val eos = (info.flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM) != 0
+                              val config = (info.flags and MediaCodec.BUFFER_FLAG_CODEC_CONFIG) != 0
+                              if (buf != null && info.size > 0 && !config) {
+                                  var t = info.presentationTimeUs - baseUs
+                                  if (t <= last) t = last + 1
+                                  last = t
+                                  info.presentationTimeUs = t
+                                  write(vTrack, buf, info)
+                              }
+                              enc.releaseOutputBuffer(i, false)
+                              if (eos) break@loop
+                          }
+                      }
+                  } catch (_: Exception) {
+                  }
+              }
+
+              private fun audioLoop() {
+                  val enc = aEnc ?: return
+                  val rec = aRec ?: return
+                  val info = MediaCodec.BufferInfo()
+                  val pcm = ByteArray(4096)
+                  var totalFrames = 0L
+                  var startUs = -1L
+                  var last = -1L
+                  var eosSent = false
+                  try {
+                      loop@ while (true) {
+                          if (!eosSent) {
+                              val idx = enc.dequeueInputBuffer(10_000)
+                              if (idx >= 0) {
+                                  val ib = enc.getInputBuffer(idx)!!
+                                  ib.clear()
+                                  val n = if (running) rec.read(pcm, 0, pcm.size) else 0
+                                  if (startUs < 0 && n > 0) startUs = System.nanoTime() / 1000 - baseUs
+                                  val pts = (if (startUs < 0) 0L else startUs) + totalFrames * 1_000_000L / sampleRate
+                                  if (n > 0) {
+                                      ib.put(pcm, 0, n)
+                                      enc.queueInputBuffer(idx, 0, n, pts, 0)
+                                      totalFrames += n / 4
+                                  } else if (!running) {
+                                      enc.queueInputBuffer(idx, 0, 0, pts, MediaCodec.BUFFER_FLAG_END_OF_STREAM)
+                                      eosSent = true
+                                  } else {
+                                      enc.queueInputBuffer(idx, 0, 0, pts, 0)
+                                      Thread.sleep(5)
+                                  }
+                              }
+                          }
+                          while (true) {
+                              val o = enc.dequeueOutputBuffer(info, 0)
+                              if (o == MediaCodec.INFO_TRY_AGAIN_LATER) break
+                              if (o == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED) {
+                                  aTrack = addTrack(enc.outputFormat)
+                                  continue
+                              }
+                              if (o >= 0) {
+                                  val buf = enc.getOutputBuffer(o)
+                                  val eos = (info.flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM) != 0
+                                  val config = (info.flags and MediaCodec.BUFFER_FLAG_CODEC_CONFIG) != 0
+                                  if (buf != null && info.size > 0 && !config) {
+                                      if (info.presentationTimeUs <= last) info.presentationTimeUs = last + 1
+                                      last = info.presentationTimeUs
+                                      write(aTrack, buf, info)
+                                  }
+                                  enc.releaseOutputBuffer(o, false)
+                                  if (eos) break@loop
+                              }
+                          }
+                      }
+                  } catch (_: Exception) {
+                      dropAudio()
+                  }
+              }
+
+              fun stop() {
+                  if (!running) return
+                  running = false
+                  runCatching { vd?.release() }
+                  vd = null
+                  runCatching { vEnc?.signalEndOfInputStream() }
+                  runCatching { aThread?.join(3000) }
+                  runCatching { vThread?.join(3000) }
+                  cleanup(!muxStarted)
+              }
+
+              private fun cleanup(deleteFile: Boolean) {
+                  runCatching { vd?.release() }
+                  runCatching { aRec?.stop() }
+                  runCatching { aRec?.release() }
+                  runCatching { aEnc?.stop() }
+                  runCatching { aEnc?.release() }
+                  runCatching { vEnc?.stop() }
+                  runCatching { vEnc?.release() }
+                  lock.withLock {
+                      runCatching { if (muxStarted) muxer?.stop() }
+                      runCatching { muxer?.release() }
+                  }
+                  runCatching { pfd?.close() }
+                  val u = uri
+                  if (u != null) {
+                      runCatching {
+                          if (deleteFile) {
+                              ctx.contentResolver.delete(u, null, null)
+                          } else {
+                              val cv = ContentValues().apply { put(MediaStore.Video.Media.IS_PENDING, 0) }
+                              ctx.contentResolver.update(u, cv, null, null)
+                          }
+                      }
+                  }
+              }
+          }
+          EOF
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: 8.7
+
+      - name: Build APK
+        run: gradle assembleDebug --no-daemon
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          cp app/build/outputs/apk/debug/app-debug.apk ScreenRecorder120.apk
+          gh release create "v${{ github.run_number }}" ScreenRecorder120.apk \
+            --title "Screen Recorder 120fps (build ${{ github.run_number }})" \
+            --notes "APK siap diinstall. Android 10+."
